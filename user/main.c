@@ -11,6 +11,7 @@
 #include "BlueSerial.h"
 #include "math.h"//正切函数
 #include "PID.h"
+#include "NRF24L01.h"
 #include "string.h"//字符串匹配strcmp、字符串分割strtok
 #include "stdlib.h"//
 uint16_t count;
@@ -57,6 +58,8 @@ PID_t TurnPID = {
 	.ErrorIntMax = 20,
 	.ErrorIntMin = -20,
 };
+int8_t RemoteLV,RemoteRH;
+
 int main()
 {
 	OLED_Init();
@@ -69,6 +72,7 @@ int main()
 	Serial_Init();
 	uart_printf(USART1,"%s","注意：发送时需要以回车作为结尾");
 	BlueSerial_Init();
+	NRF24L01_Init();
 	//BlueSerial_printf(USART2,"Test:%+5d",AZ);//蓝牙串口测试
 	while(1)
 	{
@@ -77,6 +81,13 @@ int main()
 				BlueSerial_printf(USART2,"[plot,%.2f,%.2f]", AnglePID.Target, AnglePID.Actual);
 		}
 		if(RunFlag){LED_ON();}else{LED_OFF();}
+		if(NRF24L01_Receive())
+		{
+			RemoteLV = (int8_t)NRF24L01_RxPacket[0];
+			RemoteRH = (int8_t)NRF24L01_RxPacket[1];
+			SpeedPID.Target = RemoteLV / 50.0f;
+			TurnPID.Target = RemoteRH / 25.0f;
+		}
 		if(Key_Check(0,KEY_SINGLE))
 		{
 			if(RunFlag ==0)
