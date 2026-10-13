@@ -1,6 +1,13 @@
 #include "stm32f10x.h"                  // Device header
 #include "stdio.h"
 #include "stdarg.h"//支持可变参数
+
+/*
+ * 使用固定上限的 vsnprintf 防止诊断文本越界覆盖控制变量。缓冲区保持为原工程
+ * 可承受的 256 字节，详细数据由主程序拆成短帧输出。
+ */
+#define BLUE_SERIAL_PRINTF_BUFFER_SIZE 256U
+
 char BlueSerial_RxData[200]={0};//接收缓冲区的数据
 
 
@@ -134,10 +141,14 @@ int fputc(int ch,FILE *f)
 */
 void BlueSerial_printf(USART_TypeDef *USARTx,const char *fmt,...)
 {
-	char buf[256];
+	char buf[BLUE_SERIAL_PRINTF_BUFFER_SIZE];
 	va_list agrs;//定义一个
 	va_start(agrs,fmt);//让args指向fmt之后的第一个可变参数
-	vsprintf(buf,fmt,agrs);//把fmt和可变参数格式化成字符串存入buf
+	/*
+	 * 限定格式化结果最大长度。文本过长时会被安全截断并保留字符串结尾，
+	 * 诊断数据可能不完整，但绝不能破坏栈上的控制状态。
+	 */
+	vsnprintf(buf, sizeof(buf), fmt, agrs);
 	va_end(agrs);//清理args，结束可变参数的使用
 	
 	char *p = buf;
