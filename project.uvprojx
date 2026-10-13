@@ -690,6 +690,16 @@
               <FileType>5</FileType>
               <FilePath>.\user\Kalman.h</FilePath>
             </File>
+            <File>
+              <FileName>LQR.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\user\LQR.c</FilePath>
+            </File>
+            <File>
+              <FileName>LQR.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\user\LQR.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

@@ -13,6 +13,7 @@
 #include "PID.h"
 #include "NRF24L01.h"
 #include "Kalman.h"
+#include "LQR.h"
 #include "string.h"//字符串匹配strcmp、字符串分割strtok
 #include "stdlib.h"//
 
@@ -24,12 +25,24 @@
 #define MPU6050_GYRO_LSB_PER_DPS   16.384f  /* MPU6050 已配置为 ±2000 degree/s。 */
 #define ATTITUDE_SAFETY_LIMIT_DEG  50.0f
 #define CALIBRATION_SAMPLE_COUNT   200U    /* 200 * 10 ms = 2 s 静止标定。 */
+#define DEG_TO_RAD                 0.01745329252f
+#define LQR_ENCODER_COUNTS_PER_REV 44.0f
+#define LQR_GEAR_RATIO             9.27666f
+/* 实测轮半径后替换；零值会使 LQR 配置保持不可用，杜绝未标定直接上车。 */
+#define LQR_WHEEL_RADIUS_M         0.0f
+#define LQR_REMOTE_SPEED_SCALE_MPS 0.01f
 
 typedef enum
 {
 	FILTER_MODE_COMPLEMENTARY = 0,
 	FILTER_MODE_KALMAN = 1
 } FilterMode_t;
+
+typedef enum
+{
+	CONTROL_MODE_PID = 0,
+	CONTROL_MODE_LQR = 1
+} ControlMode_t;
 
 /* 蓝牙日志中的标定状态码：0 表示允许按键启动，其余值均保持电机锁定。 */
 typedef enum
@@ -57,8 +70,23 @@ volatile CalibrationStatus_t CalibrationStatus = CALIBRATION_NOT_STILL;
 volatile uint32_t SystemTimeMs = 0;    /* TIM1 每次 1 ms 更新中断递增一次的调度时钟。 */
 volatile uint32_t AttitudeTimeMs = 0;  /* 仅在 10 ms 姿态更新点累加的日志时间戳。 */
 FilterMode_t FilterMode = FILTER_MODE_KALMAN; /* R-003 验收要求：默认采用卡尔曼。 */
+ControlMode_t ControlMode = CONTROL_MODE_PID; /* LQR 完整验收前默认保留 PID。 */
 KalmanFilter PitchKalman;
 KalmanDiagnostic PitchKalmanDiagnostic;
+LQRController LongitudinalLQR;
+/*
+ * 禁止用 PID 参数代替 LQR 增益。请由离线辨识/求解产物替换 k、版本号并将
+ * validated 置为 1；轮径也必须同步填写，LQR 才允许切换。
+ */
+const LQRConfig LongitudinalLQRConfig = {
+	.k = {0.0f, 0.0f, 0.0f, 0.0f},
+	.pwm_limit = 20.0f,
+	.pwm_slew_rate = 200.0f,
+	.max_speed_mps = 0.30f,
+	.max_accel_mps2 = 0.30f,
+	.version = 0U,
+	.validated = 0U
+};
 
 /*
  * 初始参数适合 10 ms 控制周期。实际装车后，应通过需求文档要求的静止/动态日志
@@ -77,6 +105,8 @@ int16_t AvePWM,DifPWM;//平均PWM和差分PWM
 char *Tag,*Name,*Value;//数据包的三个部分
 float LeftSpeed,RightSpeed;//左轮速度，右轮速度
 float AveSpeed,DifSpeed;//平均速度，差分速度
+float LQRPositionM, LQRVelocityMps, LQRRequestedSpeedMps;
+int32_t LeftEncoderAccum, RightEncoderAccum;
 PID_t AnglePID = {
 	.Kp=5,
 	.Ki=0.1,
@@ -219,6 +249,7 @@ int main()
 	Serial_Init();
 	BlueSerial_Init();
 	NRF24L01_Init();
+	LQR_Init(&LongitudinalLQR, &LongitudinalLQRConfig);
 	/* 先让电机保持禁用状态完成标定，再开启会访问 IMU 的定时器中断。 */
 	if (!Attitude_Calibrate())
 	{
@@ -248,15 +279,24 @@ int main()
 			RemoteLV = (int8_t)NRF24L01_RxPacket[0];
 			RemoteRH = (int8_t)NRF24L01_RxPacket[1];
 			SpeedPID.Target = RemoteLV / 50.0f;
+			LQRRequestedSpeedMps = RemoteLV * LQR_REMOTE_SPEED_SCALE_MPS;
 			TurnPID.Target = RemoteRH / 25.0f;
 		}
-		if(Key_Check(0,KEY_SINGLE))
+		/* PB1 按下沿立即启停；原 KEY_SINGLE 需松开后再等待 200 ms，现场易被误判为无响应。 */
+		if(Key_Check(0,KEY_DOWN))
 		{
 			if((RunFlag == 0) && FilterReady && !ImuFault)
 			{
+				if ((ControlMode == CONTROL_MODE_LQR) &&
+					(!LQR_IsConfigUsable(&LongitudinalLQR) || (LQR_WHEEL_RADIUS_M <= 0.0f)))
+				{
+					BlueSerial_printf(USART2,"[lqr,enable=denied,reason=config]");
+					continue;
+				}
 				PID_Init(&AnglePID);
 				PID_Init(&SpeedPID);
 				PID_Init(&TurnPID);
+				LQR_Reset(&LongitudinalLQR, LQRPositionM);
 				RunFlag=1;
 			}
 			else{RunFlag=0;}
@@ -340,6 +380,21 @@ int main()
 						FilterMode = (FilterMode_t)requested_mode;
 					}
 				}
+				else if(strcmp(Name,"ControlMode")==0)//0：PID，1：LQR；只允许停车且零速度时切换
+				{
+					uint8_t requested_mode = (uint8_t)atoi(Value);
+					if ((RunFlag == 0) && (LQRRequestedSpeedMps > -0.001f) &&
+						(LQRRequestedSpeedMps < 0.001f))
+					{
+						if ((requested_mode == CONTROL_MODE_PID) ||
+							((requested_mode == CONTROL_MODE_LQR) && LQR_IsConfigUsable(&LongitudinalLQR) &&
+							 (LQR_WHEEL_RADIUS_M > 0.0f)))
+						{
+							ControlMode = (ControlMode_t)requested_mode;
+							LQR_Reset(&LongitudinalLQR, LQRPositionM);
+						}
+					}
+				}
 			}
 			else if(strcmp(Tag,"joystick")==0)//摇杆
 			{
@@ -348,6 +403,7 @@ int main()
 				int16_t RH = atoi(strtok(NULL,","));//RH（右摇杆水平）：左转/右转。往右推为正，往左为负。
 				int16_t RV = atoi(strtok(NULL,","));
 				SpeedPID.Target = LV/50.0;//目标速度控制在-2~2之间
+				LQRRequestedSpeedMps = LV * LQR_REMOTE_SPEED_SCALE_MPS;
 				TurnPID.Target = RH/25.0;//差分速度控制在-4到4
 				
 			}
@@ -361,7 +417,9 @@ int main()
 		OLED_Printf(0,32,OLED_6X8,"T:%+05.2f",AnglePID.Target);
 		OLED_Printf(0,40,OLED_6X8,"A:%+05.2f",AngleFinal);
 		OLED_Printf(0,48,OLED_6X8,"O:%+05.2f",AnglePID.Out);
-		OLED_Printf(0,56,OLED_6X8,"Offset:%+05.2f",AnglePID.OutOffset);
+		/* 启动失败时先看 F/E/C：F=滤波器就绪，E=IMU 故障，C=标定状态。T 必须递增。 */
+		OLED_Printf(0,56,OLED_6X8,"T%lu R%dF%dE%dC%d", SystemTimeMs / 1000U,
+			RunFlag, FilterReady, ImuFault, CalibrationStatus);
 		
 		OLED_Printf(50,0,OLED_6X8,"   Speed");
 		OLED_Printf(50,8,OLED_6X8,"P:%+05.2f",SpeedPID.Kp);
@@ -399,10 +457,24 @@ void TIM1_UP_IRQHandler(void)//1ms
 			float gyro_y_dps;
 			float accel_magnitude_g;
 			float actual_dt_s;
+			float wheel_m_per_count;
+			int16_t left_encoder_delta;
+			int16_t right_encoder_delta;
 			Count0=0;
 			AttitudeTimeMs = SystemTimeMs;
 			actual_dt_s = (float)(AttitudeTimeMs - LastAttitudeTimeMs) / 1000.0f;
 			LastAttitudeTimeMs = AttitudeTimeMs;
+			/* 编码器在 100 Hz 读取；累计量仍提供 PID 的 50 ms 速度窗口。 */
+			left_encoder_delta = Encoder_Get(1);
+			right_encoder_delta = Encoder_Get(2);
+			LeftEncoderAccum += left_encoder_delta;
+			RightEncoderAccum += right_encoder_delta;
+			wheel_m_per_count = 6.283185307f * LQR_WHEEL_RADIUS_M /
+				(LQR_ENCODER_COUNTS_PER_REV * LQR_GEAR_RATIO);
+			LQRPositionM += ((float)left_encoder_delta + (float)right_encoder_delta) *
+				0.5f * wheel_m_per_count;
+			LQRVelocityMps = ((float)left_encoder_delta + (float)right_encoder_delta) *
+				0.5f * wheel_m_per_count / actual_dt_s;
 			MPU6050_GetData(&AX,&AY,&AZ,&GX,&GY,&GZ);//加速度计和陀螺仪数据
 			gyro_y_dps = (float)GY / MPU6050_GYRO_LSB_PER_DPS;
 			/* 从原始传感器角中减去上电标定的机械零位，平衡姿态即为 0°。 */
@@ -452,38 +524,65 @@ void TIM1_UP_IRQHandler(void)//1ms
 			{
 				RunFlag = 0;
 			}
-			if(RunFlag)//只有开启了RunFlag才进行PID控制
+			if(RunFlag)
 			{
-				//PID第一步：计算当前最新的俯仰角
-				AnglePID.Actual =  AngleFinal;
-				
-				//PID第二步：根据目标倾角计算输出到电机的平均PWM(假定目标角度为0)
-				PID_Update(&AnglePID);//得到输出值
-				AvePWM = -AnglePID.Out;
-				
-				//变量转换
-				LeftPWM = AvePWM + DifPWM/2;
-				RightPWM = AvePWM - DifPWM/2;
-				//输出限幅
-				if(LeftPWM>100){LeftPWM = 100;}else if(LeftPWM <-100){LeftPWM = -100;}
-				if(RightPWM>100){RightPWM = 100;}else if(RightPWM <-100){RightPWM = -100;}
-				
-				Motor_SetPWM(1,LeftPWM);
-				Motor_SetPWM(2,RightPWM);
+				if (ControlMode == CONTROL_MODE_LQR)
+				{
+					LQRState state;
+					float lqr_pwm;
+					state.theta_rad = AngleKalman * DEG_TO_RAD;
+					state.theta_rate_rad_s = PitchKalmanDiagnostic.rate * DEG_TO_RAD;
+					state.position_m = LQRPositionM;
+					state.velocity_mps = LQRVelocityMps;
+					if (LQR_Update(&LongitudinalLQR, &state, LQRRequestedSpeedMps,
+						actual_dt_s, &lqr_pwm))
+					{
+						AvePWM = (int16_t)lqr_pwm;
+					}
+					else
+					{
+						/* 非法 dt、状态或配置时同周期锁定。 */
+						RunFlag = 0;
+					}
+				}
+				else
+				{
+					AnglePID.Actual = AngleFinal;
+					PID_Update(&AnglePID);
+					AvePWM = -AnglePID.Out;
+				}
+
+				if (RunFlag)
+				{
+					LeftPWM = AvePWM + DifPWM/2;
+					RightPWM = AvePWM - DifPWM/2;
+					if(LeftPWM>100){LeftPWM = 100;}else if(LeftPWM <-100){LeftPWM = -100;}
+					if(RightPWM>100){RightPWM = 100;}else if(RightPWM <-100){RightPWM = -100;}
+					Motor_SetPWM(1,LeftPWM);
+					Motor_SetPWM(2,RightPWM);
+				}
+				else
+				{
+					Motor_SetPWM(1,0);
+					Motor_SetPWM(2,0);
+				}
 			}
 			else
-				{
-					Motor_SetPWM(1,0);//左电机PWM设置为0
-					Motor_SetPWM(2,0);//右电机PWM设置为0
-				}
+			{
+				Motor_SetPWM(1,0);
+				Motor_SetPWM(2,0);
+			}
 			
 		}
 		Count1++;
 		if(Count1>=50)
 		{
 			Count1=0;
-			LeftSpeed = Encoder_Get(1)/44.0/0.05/9.27666;//获取增量值,并计算每秒转速
-			RightSpeed = Encoder_Get(2)/44.0/0.05/9.27666;//44是编码器极数，0.05是从50ms转化为s,9.27666减速比
+			/* 10 ms 时已读取并清零硬件计数器，这里使用累计量保持 PID 原有 50 ms 窗口。 */
+			LeftSpeed = LeftEncoderAccum/44.0f/0.05f/9.27666f;
+			RightSpeed = RightEncoderAccum/44.0f/0.05f/9.27666f;
+			LeftEncoderAccum = 0;
+			RightEncoderAccum = 0;
 			AveSpeed = (LeftSpeed + RightSpeed)/2;
 			DifSpeed = LeftSpeed - RightSpeed;
 			
